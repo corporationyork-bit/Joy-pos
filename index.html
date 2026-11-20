@@ -154,6 +154,7 @@ textarea.form-control{resize:vertical;min-height:60px}
     <input type="password" id="login-pin" placeholder="Masukkan PIN" maxlength="6" inputmode="numeric" onkeydown="if(event.key==='Enter')doLogin()">
     <button onclick="doLogin()">Masuk</button>
     <p id="login-status" style="color:var(--muted);font-size:.75rem;margin-top:12px">Menghubungkan...</p>
+    <button type="button" id="login-fallback-local" class="btn btn-ghost btn-sm" style="display:none;width:100%;justify-content:center;margin-top:8px" onclick="switchStorageMode('local')">Pakai Mode LocalStorage</button>
   </div>
 </div>
 
@@ -516,14 +517,22 @@ const firebaseConfig = {
   appId: "1:901812081611:web:da9f31b337ac7abd599c4e"
 };
 
-const app = initializeApp(firebaseConfig);
-const db = getFirestore(app);
+let app = null, db = null;
+try{
+  app = initializeApp(firebaseConfig);
+  db = getFirestore(app);
+}catch(err){
+  FIREBASE_OK = false;
+  console.error("Gagal inisialisasi Firebase:", err);
+}
 
 const STORAGE_MODE_KEY = 'joy_pos_storage_mode';
 const LOCAL_DB_KEY = 'joy_pos_local_v1';
 
-let storageMode = (!FIREBASE_OK || localStorage.getItem(STORAGE_MODE_KEY) === 'local') ? 'local' : 'cloud';
+const isFileProtocol = window.location.protocol === 'file:';
+let storageMode = (!FIREBASE_OK || isFileProtocol || localStorage.getItem(STORAGE_MODE_KEY) === 'local') ? 'local' : 'cloud';
 let cloudUnsubscribers = [];
+let isSeedingCloud = false;
 
 const DEFAULT_SETTINGS = {
   appName:'JOY POS',
@@ -561,21 +570,31 @@ let pendingAppLogoData=null,pendingProductPhotoData=null,pendingOutletPhotoData=
 
 const rp=n=>'Rp '+Number(n||0).toLocaleString('id-ID');
 const uid=()=>'ID'+Date.now().toString(36).toUpperCase()+Math.random().toString(36).slice(2,5).toUpperCase();
-const fmtDate=d=>new Date(d).toLocaleString('id-ID',{dateStyle:'short',timeStyle:'short'});
-const fmtDay=d=>new Date(d).toLocaleDateString('id-ID',{weekday:'short',day:'numeric',month:'short'});
+const fmtDate=d=>{
+  const dt=new Date(d);
+  return isNaN(dt.getTime())?'-':dt.toLocaleString('id-ID',{dateStyle:'short',timeStyle:'short'});
+};
+const fmtDay=d=>{
+  const dt=new Date(d);
+  return isNaN(dt.getTime())?'-':dt.toLocaleDateString('id-ID',{weekday:'short',day:'numeric',month:'short'});
+};
 const todayISO=()=>new Date().toISOString().split('T')[0];
+const normRole=r=>String(r||'').trim().toLowerCase();
 
 function toast(msg,type='ok'){
-  const c=document.getElementById('toast-container'),t=document.createElement('div');
+  const c=document.getElementById('toast-container');
+  if(!c)return;
+  const t=document.createElement('div');
   t.className='toast '+(type==='err'?'err':'');
   t.textContent=msg;c.appendChild(t);
-  setTimeout(()=>t.remove(),3200);
+  setTimeout(()=>t.remove(),3500);
 }
-window.closeM=id=>document.getElementById(id).classList.remove('active');
+window.closeM=id=>document.getElementById(id)?.classList.remove('active');
 document.querySelectorAll('.modal-bg').forEach(m=>m.addEventListener('click',e=>{if(e.target===m)m.classList.remove('active')}));
 
 function updateStatusPill(){
   const s=document.getElementById('net-status');
+  if(!s)return;
   if(storageMode==='local'){
     s.className='status-pill status-local';
     s.textContent='● LocalStorage Mode';
@@ -592,7 +611,6 @@ function updateStatusPill(){
 window.addEventListener('online',updateStatusPill);
 window.addEventListener('offline',updateStatusPill);
 
-// === LOCAL STORAGE ADAPTER ===
 function getDefaultSeedPayload(){
   const outletId = uid();
   return {
@@ -620,9 +638,20 @@ function readLocalDB(){
   }
   try{
     const parsed = JSON.parse(raw);
+    const seed = getDefaultSeedPayload();
+    const outlets = Array.isArray(parsed.outlets) && parsed.outlets.length ? parsed.outlets : seed.outlets;
+    const defaultOutletId = outlets[0].id;
+    let employees = Array.isArray(parsed.employees) ? parsed.employees : [];
+    const hasOwner = employees.some(e => normRole(e.role) === 'owner');
+    if(!hasOwner){
+      employees = [
+        { id: uid(), name:'Ade Kurnia Sandy', role:'owner', outletId: defaultOutletId, pin:'1111' },
+        ...employees
+      ];
+    }
     return {
-      employees: Array.isArray(parsed.employees)?parsed.employees:[],
-      outlets: Array.isArray(parsed.outlets)?parsed.outlets:[],
+      outlets,
+      employees,
       products: Array.isArray(parsed.products)?parsed.products:[],
       transactions: Array.isArray(parsed.transactions)?parsed.transactions:[],
       paymentMethods: Array.isArray(parsed.paymentMethods)?parsed.paymentMethods:[],
@@ -639,18 +668,7 @@ function writeLocalDB(dbObj){
   localStorage.setItem(LOCAL_DB_KEY, JSON.stringify(dbObj));
 }
 
-function syncStateFromLocal(){
-  const local = readLocalDB();
-  state.employees = [...local.employees];
-  state.outlets = [...local.outlets];
-  state.products = [...local.products];
-  state.transactions = [...local.transactions].sort((a,b)=>new Date(b.date)-new Date(a.date));
-  state.paymentMethods = {qris:[], bank:[], ewallet:[]};
-  (local.paymentMethods||[]).forEach(pm=>{
-    if(state.paymentMethods[pm.type]) state.paymentMethods[pm.type].push({...pm});
-  });
-  state.settings = { ...DEFAULT_SETTINGS, ...(local.settings||{}) };
-
+function renderAllViews(){
   renderLoginUsers();
   renderEmployees();
   renderOutlets();
@@ -664,7 +682,20 @@ function syncStateFromLocal(){
   renderReceiptPreview();
 }
 
-// === KOMPRESI GAMBAR ===
+function syncStateFromLocal(){
+  const local = readLocalDB();
+  state.employees = [...local.employees];
+  state.outlets = [...local.outlets];
+  state.products = [...local.products];
+  state.transactions = [...local.transactions].sort((a,b)=>new Date(b.date)-new Date(a.date));
+  state.paymentMethods = {qris:[], bank:[], ewallet:[]};
+  (local.paymentMethods||[]).forEach(pm=>{
+    if(state.paymentMethods[pm.type]) state.paymentMethods[pm.type].push({...pm});
+  });
+  state.settings = { ...DEFAULT_SETTINGS, ...(local.settings||{}) };
+  renderAllViews();
+}
+
 function compressImage(file, maxWidth = 550, quality = 0.8) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -693,7 +724,6 @@ function compressImage(file, maxWidth = 550, quality = 0.8) {
   });
 }
 
-// === TERAPKAN NAMA & LOGO APLIKASI ===
 function applyAppBranding(){
   const appName = state.settings.appName || 'JOY POS';
   const appLogo = pendingAppLogoData !== null ? pendingAppLogoData : (state.settings.appLogo || '');
@@ -722,19 +752,26 @@ function applyAppBranding(){
   }
 }
 
+function setLoginStatus(msg, colorVar='var(--muted)', showLocalBtn=false){
+  const statusEl = document.getElementById('login-status');
+  const localBtn = document.getElementById('login-fallback-local');
+  if(statusEl){
+    statusEl.textContent = msg;
+    statusEl.style.color = colorVar;
+  }
+  if(localBtn){
+    localBtn.style.display = showLocalBtn ? 'inline-flex' : 'none';
+  }
+}
+
 function updateStorageModeUI(){
   const selMode = document.getElementById('set-storage-mode');
-  const statusEl = document.getElementById('login-status');
   if(selMode) selMode.value = storageMode;
 
-  if(statusEl){
-    if(storageMode === 'local'){
-      statusEl.textContent = '✓ Penyimpanan Lokal (LocalStorage) aktif';
-      statusEl.style.color = 'var(--info)';
-    }else{
-      statusEl.textContent = '✓ Terhubung ke cloud';
-      statusEl.style.color = 'var(--accent)';
-    }
+  if(storageMode === 'local'){
+    setLoginStatus('✓ Penyimpanan Lokal (LocalStorage) aktif', 'var(--info)', false);
+  }else{
+    setLoginStatus('Menghubungkan ke cloud...', 'var(--muted)', false);
   }
   updateStatusPill();
 }
@@ -744,31 +781,96 @@ function unsubscribeCloud(){
   cloudUnsubscribers = [];
 }
 
+function handleCloudError(label, err){
+  console.error(`[Firestore ${label}]`, err);
+  if(storageMode !== 'cloud') return;
+  const code = err?.code || '';
+  const detail = code === 'permission-denied'
+    ? 'Akses ditolak (cek Firestore Rules)'
+    : (err?.message || 'Gagal sinkronisasi cloud');
+  setLoginStatus(`✕ ${detail}`, 'var(--danger)', true);
+  toast(`${label}: ${detail}`, 'err');
+}
+
 function subscribeCloud(){
   unsubscribeCloud();
-  cloudUnsubscribers.push(
-    onSnapshot(collection(db,'employees'),s=>{if(storageMode!=='cloud')return;state.employees=s.docs.map(d=>({id:d.id,...d.data()}));renderLoginUsers();renderEmployees();}),
-    onSnapshot(collection(db,'outlets'),s=>{if(storageMode!=='cloud')return;state.outlets=s.docs.map(d=>({id:d.id,...d.data()}));renderOutlets();updateOutletSelects();renderEmployees();renderDashboard();}),
-    onSnapshot(collection(db,'products'),s=>{if(storageMode!=='cloud')return;state.products=s.docs.map(d=>({id:d.id,...d.data()}));renderProducts();renderDashboard();}),
-    onSnapshot(collection(db,'transactions'),s=>{
-      if(storageMode!=='cloud')return;
-      state.transactions=s.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>new Date(b.date)-new Date(a.date));
-      renderDashboard();renderTrx();
-    }),
-    onSnapshot(collection(db,'paymentMethods'),s=>{
-      if(storageMode!=='cloud')return;
-      state.paymentMethods={qris:[],bank:[],ewallet:[]};
-      s.docs.forEach(d=>{const pm={id:d.id,...d.data()};if(state.paymentMethods[pm.type])state.paymentMethods[pm.type].push(pm)});
+
+  const unsubEmp = onSnapshot(
+    collection(db,'employees'),
+    s => {
+      if(storageMode!=='cloud') return;
+      state.employees = s.docs.map(d => ({ id:d.id, ...d.data() }));
+      renderLoginUsers();
+      renderEmployees();
+      if(state.employees.some(e => normRole(e.role) === 'owner')){
+        setLoginStatus('✓ Terhubung ke cloud', 'var(--accent)', false);
+      }
+    },
+    err => handleCloudError('Karyawan', err)
+  );
+
+  const unsubOut = onSnapshot(
+    collection(db,'outlets'),
+    s => {
+      if(storageMode!=='cloud') return;
+      state.outlets = s.docs.map(d => ({ id:d.id, ...d.data() }));
+      renderOutlets();
+      updateOutletSelects();
+      renderEmployees();
+      renderDashboard();
+    },
+    err => handleCloudError('Outlet', err)
+  );
+
+  const unsubProd = onSnapshot(
+    collection(db,'products'),
+    s => {
+      if(storageMode!=='cloud') return;
+      state.products = s.docs.map(d => ({ id:d.id, ...d.data() }));
+      renderProducts();
+      renderDashboard();
+    },
+    err => handleCloudError('Produk', err)
+  );
+
+  const unsubTrx = onSnapshot(
+    collection(db,'transactions'),
+    s => {
+      if(storageMode!=='cloud') return;
+      state.transactions = s.docs.map(d => ({ id:d.id, ...d.data() })).sort((a,b)=>new Date(b.date)-new Date(a.date));
+      renderDashboard();
+      renderTrx();
+    },
+    err => handleCloudError('Transaksi', err)
+  );
+
+  const unsubPay = onSnapshot(
+    collection(db,'paymentMethods'),
+    s => {
+      if(storageMode!=='cloud') return;
+      state.paymentMethods = {qris:[], bank:[], ewallet:[]};
+      s.docs.forEach(d => {
+        const pm = { id:d.id, ...d.data() };
+        if(state.paymentMethods[pm.type]) state.paymentMethods[pm.type].push(pm);
+      });
       renderPayments();
-    }),
-    onSnapshot(doc(db,'settings','main'),s=>{
-      if(storageMode!=='cloud')return;
-      if(s.exists()){state.settings={...DEFAULT_SETTINGS,...s.data()};}
+    },
+    err => handleCloudError('Pembayaran', err)
+  );
+
+  const unsubSet = onSnapshot(
+    doc(db,'settings','main'),
+    s => {
+      if(storageMode!=='cloud') return;
+      if(s.exists()){ state.settings = { ...DEFAULT_SETTINGS, ...s.data() }; }
       loadSettings();
       applyAppBranding();
       renderReceiptPreview();
-    })
+    },
+    err => handleCloudError('Pengaturan', err)
   );
+
+  cloudUnsubscribers = [unsubEmp, unsubOut, unsubProd, unsubTrx, unsubPay, unsubSet];
 }
 
 async function activateStorageMode(mode){
@@ -786,8 +888,8 @@ async function activateStorageMode(mode){
 }
 
 window.switchStorageMode = async (mode) => {
-  if(mode === storageMode) return;
-  if(!FIREBASE_OK && mode==='cloud') return toast('Firebase belum tersambung, tetap memakai mode lokal','err');
+  if(mode === storageMode && mode === 'local') return syncStateFromLocal();
+  if(!FIREBASE_OK && mode === 'cloud') return toast('Firebase belum tersambung, tetap memakai mode lokal','err');
   await activateStorageMode(mode);
   toast(mode === 'local' ? 'Beralih ke penyimpanan LocalStorage' : 'Beralih ke penyimpanan Cloud');
 };
@@ -815,6 +917,7 @@ window.copyCurrentToLocalStorage = () => {
 };
 
 window.copyLocalToCloud = async () => {
+  if(!FIREBASE_OK) return toast('Firebase tidak tersedia','err');
   if(!confirm('Salin seluruh data dari LocalStorage ke Cloud (Firebase)?')) return;
   try{
     const local = readLocalDB();
@@ -830,70 +933,87 @@ window.copyLocalToCloud = async () => {
   }
 };
 
-// === LOGIN ===
 function renderLoginUsers(){
-  const admins=state.employees.filter(e=>e.role==='owner');
-  document.getElementById('login-user').innerHTML='<option value="">— Pilih Owner —</option>'+admins.map(e=>`<option value="${e.id}">${e.name} (${e.role})</option>`).join('');
+  const sel = document.getElementById('login-user');
+  if(!sel) return;
+  const prevVal = sel.value;
+  const admins = state.employees.filter(e => normRole(e.role) === 'owner');
+  sel.innerHTML = '<option value="">— Pilih Owner —</option>' +
+    admins.map(e => `<option value="${e.id}">${e.name} (Owner)</option>`).join('');
+  if(prevVal && admins.some(e => e.id === prevVal)){
+    sel.value = prevVal;
+  }else if(admins.length === 1){
+    sel.value = admins[0].id;
+  }
 }
-window.doLogin=()=>{
-  const id=document.getElementById('login-user').value,pin=document.getElementById('login-pin').value;
-  if(!id)return toast('Pilih admin terlebih dahulu','err');
-  const e=state.employees.find(x=>x.id===id);
-  if(!e||e.role!=='owner')return toast('Hanya owner yang bisa masuk admin','err');
-  if(e.pin!==pin)return toast('PIN salah','err');
-  currentUser=e;
-  document.getElementById('login-screen').style.display='none';
-  document.getElementById('sidebar').style.display='flex';
-  document.getElementById('main-app').style.display='flex';
-  document.getElementById('ua-name').textContent=e.name;
-  document.getElementById('ua-role').textContent=e.role;
+
+window.doLogin = () => {
+  const id = document.getElementById('login-user').value;
+  const pin = String(document.getElementById('login-pin').value || '').trim();
+  if(!id) return toast('Pilih owner terlebih dahulu','err');
+  const e = state.employees.find(x => x.id === id);
+  if(!e || normRole(e.role) !== 'owner') return toast('Hanya owner yang bisa masuk admin','err');
+  if(String(e.pin || '').trim() !== pin) return toast('PIN salah','err');
+  currentUser = e;
+  document.getElementById('login-screen').style.display = 'none';
+  document.getElementById('sidebar').style.display = 'flex';
+  document.getElementById('main-app').style.display = 'flex';
+  document.getElementById('ua-name').textContent = e.name;
+  document.getElementById('ua-role').textContent = e.role;
   updateStatusPill();
   renderReceiptPreview();
   go('dashboard');
 };
-window.doLogout=()=>{
-  if(!confirm('Keluar dari dashboard admin?'))return;
-  currentUser=null;
-  document.getElementById('login-pin').value='';
-  document.getElementById('login-screen').style.display='flex';
-  document.getElementById('sidebar').style.display='none';
-  document.getElementById('main-app').style.display='none';
+
+window.doLogout = () => {
+  if(!confirm('Keluar dari dashboard admin?')) return;
+  currentUser = null;
+  document.getElementById('login-pin').value = '';
+  document.getElementById('login-screen').style.display = 'flex';
+  document.getElementById('sidebar').style.display = 'none';
+  document.getElementById('main-app').style.display = 'none';
 };
 
-// === NAV ===
-window.go=v=>{
-  currentView=v;
-  document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));
-  document.getElementById('view-'+v).classList.add('active');
-  document.querySelectorAll('.nav-item').forEach(x=>x.classList.remove('active'));
-  document.querySelector(`.nav-item[data-view="${v}"]`).classList.add('active');
-  const t={dashboard:'Dashboard',transactions:'Transaksi',products:'Produk & Stok',outlets:'Outlet',employees:'Karyawan',payments:'Pembayaran',settings:'Pengaturan'};
-  document.getElementById('page-title').textContent=t[v];
-  if(v==='settings')renderReceiptPreview();
+window.go = v => {
+  currentView = v;
+  document.querySelectorAll('.view').forEach(x => x.classList.remove('active'));
+  document.getElementById('view-'+v)?.classList.add('active');
+  document.querySelectorAll('.nav-item').forEach(x => x.classList.remove('active'));
+  document.querySelector(`.nav-item[data-view="${v}"]`)?.classList.add('active');
+  const t = {
+    dashboard:'Dashboard',
+    transactions:'Transaksi',
+    products:'Produk & Stok',
+    outlets:'Outlet',
+    employees:'Karyawan',
+    payments:'Pembayaran',
+    settings:'Pengaturan'
+  };
+  document.getElementById('page-title').textContent = t[v] || 'Dashboard';
+  if(v === 'settings') renderReceiptPreview();
 };
 
 function calcTrxProfit(t){
-  let profit=0;
-  (t.items||[]).forEach(i=>{
-    const prod=state.products.find(p=>p.id===i.id);
-    const cost=i.costPrice!==undefined ? i.costPrice : (prod?.costPrice||0);
-    profit+=(i.price - cost)*(i.qty||1);
+  let profit = 0;
+  (t.items||[]).forEach(i => {
+    const prod = state.products.find(p => p.id === i.id);
+    const cost = i.costPrice !== undefined ? i.costPrice : (prod?.costPrice || 0);
+    profit += (Number(i.price||0) - Number(cost||0)) * Number(i.qty||1);
   });
-  return profit - (t.discount||0);
+  return profit - Number(t.discount||0);
 }
 
-// === DASHBOARD + PILIHAN GRAFIK ===
 function renderDashboard(){
-  const validTrx=state.transactions.filter(t=>t.status!=='refunded');
-  const total=validTrx.reduce((s,t)=>s+(t.total||0),0);
-  const todayTrx=validTrx.filter(t=>t.date && t.date.split('T')[0]===todayISO());
-  const today=todayTrx.reduce((s,t)=>s+(t.total||0),0);
+  const validTrx = state.transactions.filter(t => t.status !== 'refunded');
+  const total = validTrx.reduce((s,t) => s + Number(t.total||0), 0);
+  const todayTrx = validTrx.filter(t => t.date && String(t.date).split('T')[0] === todayISO());
+  const today = todayTrx.reduce((s,t) => s + Number(t.total||0), 0);
 
-  let grossProfit=0;
-  validTrx.forEach(t=>{ grossProfit += calcTrxProfit(t); });
+  let grossProfit = 0;
+  validTrx.forEach(t => { grossProfit += calcTrxProfit(t); });
 
-  const lowStock=state.products.filter(p=>p.stock<10).length;
-  document.getElementById('dash-stats').innerHTML=`
+  const lowStock = state.products.filter(p => Number(p.stock||0) < 10).length;
+  document.getElementById('dash-stats').innerHTML = `
     <div class="stat accent"><div class="lbl">Omzet Hari Ini</div><div class="val">${rp(today)}</div><div class="sub-val">${todayTrx.length} transaksi sukses</div></div>
     <div class="stat"><div class="lbl">Total Omzet Bersih</div><div class="val">${rp(total)}</div><div class="sub-val">${validTrx.length} total sukses</div></div>
     <div class="stat gold"><div class="lbl">Estimasi Laba Kotor</div><div class="val" style="color:var(--gold)">${rp(grossProfit)}</div><div class="sub-val">Berdasarkan harga modal</div></div>
@@ -907,41 +1027,46 @@ function renderDashboard(){
     if(titleEl) titleEl.textContent = '🏪 Omzet Bersih per Outlet (Non-Refund)';
     const outletMap = new Map();
     state.outlets.forEach(o => outletMap.set(o.id, { label: o.name, val: 0 }));
-    validTrx.forEach(t=>{
+    validTrx.forEach(t => {
       const key = t.outletId || t.outletName || 'lainnya';
       const current = outletMap.get(key) || { label: t.outletName || 'Outlet', val: 0 };
-      current.val += (t.total||0);
+      current.val += Number(t.total||0);
       outletMap.set(key, current);
     });
     const rows = Array.from(outletMap.values());
     if(!rows.length){
       chartEl.innerHTML = '<div class="empty" style="width:100%">Belum ada data outlet</div>';
     }else{
-      const max = Math.max(...rows.map(r=>r.val), 1);
-      chartEl.innerHTML = rows.map(r=>`
+      const max = Math.max(...rows.map(r => r.val), 1);
+      chartEl.innerHTML = rows.map(r => `
         <div class="chart-bar blue-bar" style="height:${Math.max((r.val/max)*100,3)}%">
           <div class="cv">${r.val>0?rp(r.val):'Rp 0'}</div>
           <div class="cl" title="${r.label}">${r.label}</div>
         </div>`).join('');
     }
   }else{
-    const days=[];for(let i=6;i>=0;i--){const d=new Date();d.setDate(d.getDate()-i);days.push(d.toISOString().split('T')[0])}
+    const days = [];
+    for(let i=6; i>=0; i--){
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      days.push(d.toISOString().split('T')[0]);
+    }
     let barClass = '';
     let values = [];
     if(chartType === 'profit'){
       if(titleEl) titleEl.textContent = '💰 Laba Kotor 7 Hari Terakhir (Non-Refund)';
       barClass = 'gold-bar';
-      values = days.map(d=>validTrx.filter(t=>t.date && t.date.split('T')[0]===d).reduce((s,t)=>s+calcTrxProfit(t),0));
+      values = days.map(d => validTrx.filter(t => t.date && String(t.date).split('T')[0] === d).reduce((s,t) => s + calcTrxProfit(t), 0));
     }else if(chartType === 'count'){
       if(titleEl) titleEl.textContent = '🧾 Jumlah Transaksi 7 Hari Terakhir';
       barClass = 'blue-bar';
-      values = days.map(d=>validTrx.filter(t=>t.date && t.date.split('T')[0]===d).length);
+      values = days.map(d => validTrx.filter(t => t.date && String(t.date).split('T')[0] === d).length);
     }else{
       if(titleEl) titleEl.textContent = '📈 Omzet 7 Hari Terakhir (Non-Refund)';
-      values = days.map(d=>validTrx.filter(t=>t.date && t.date.split('T')[0]===d).reduce((s,t)=>s+(t.total||0),0));
+      values = days.map(d => validTrx.filter(t => t.date && String(t.date).split('T')[0] === d).reduce((s,t) => s + Number(t.total||0), 0));
     }
     const max = Math.max(...values, 1);
-    chartEl.innerHTML = values.map((v,i)=>{
+    chartEl.innerHTML = values.map((v,i) => {
       const labelVal = chartType === 'count' ? (v>0?`${v} trx`:'') : (v>0?rp(v):'');
       return `<div class="chart-bar ${barClass}" style="height:${Math.max((v/max)*100,2)}%">
         <div class="cv">${labelVal}</div>
@@ -950,92 +1075,107 @@ function renderDashboard(){
     }).join('');
   }
 
-  const recent=state.transactions.slice(0,10);
-  document.querySelector('#recent-trx tbody').innerHTML=recent.length?recent.map(t=>`
+  const recent = state.transactions.slice(0,10);
+  document.querySelector('#recent-trx tbody').innerHTML = recent.length ? recent.map(t => `
     <tr>
       <td><strong>${t.id}</strong></td>
       <td>${t.outletName||'-'}</td>
       <td>${t.employeeName||'-'}</td>
       <td style="color:var(--muted);font-size:.8rem">${fmtDate(t.date)}</td>
       <td style="color:${t.status==='refunded'?'var(--muted)':'var(--accent)'};font-weight:600;${t.status==='refunded'?'text-decoration:line-through':''}">${rp(t.total)}</td>
-      <td><span class="badge badge-info">${t.method}</span></td>
+      <td><span class="badge badge-info">${t.method||'-'}</span></td>
       <td><span class="badge ${t.status==='refunded'?'badge-danger':'badge-ok'}">${t.status==='refunded'?'Refunded':'Selesai'}</span></td>
-    </tr>`).join(''):'<tr><td colspan="7" class="empty">Belum ada transaksi</td></tr>';
+    </tr>`).join('') : '<tr><td colspan="7" class="empty">Belum ada transaksi</td></tr>';
 }
 
-// === TRANSACTIONS + ATUR ULANG + CSV & KIRIM VIA WA/EMAIL/SHARE ===
 function updateOutletSelects(){
-  const opts=state.outlets.map(o=>`<option value="${o.id}">${o.name}</option>`).join('');
-  document.getElementById('trx-outlet').innerHTML='<option value="all">Semua Outlet</option>'+opts;
-  document.getElementById('f-employee-outlet').innerHTML='<option value="">— Pilih Outlet —</option>'+opts;
+  const opts = state.outlets.map(o => `<option value="${o.id}">${o.name}</option>`).join('');
+  const trxOut = document.getElementById('trx-outlet');
+  const empOut = document.getElementById('f-employee-outlet');
+  if(trxOut){
+    const prev = trxOut.value;
+    trxOut.innerHTML = '<option value="all">Semua Outlet</option>' + opts;
+    if(prev) trxOut.value = prev;
+  }
+  if(empOut){
+    const prevEmp = empOut.value;
+    empOut.innerHTML = '<option value="">— Pilih Outlet —</option>' + opts;
+    if(prevEmp) empOut.value = prevEmp;
+  }
 }
-window.resetTrxFilters=()=>{
-  document.getElementById('trx-from').value='';
-  document.getElementById('trx-to').value='';
-  document.getElementById('trx-outlet').value='all';
-  document.getElementById('trx-status').value='all';
+
+window.resetTrxFilters = () => {
+  document.getElementById('trx-from').value = '';
+  document.getElementById('trx-to').value = '';
+  document.getElementById('trx-outlet').value = 'all';
+  document.getElementById('trx-status').value = 'all';
   renderTrx();
   toast('Filter transaksi diatur ulang');
 };
-window.resetAllTransactions=async()=>{
-  if(!state.transactions.length)return toast('Tidak ada riwayat transaksi untuk dihapus','err');
-  if(!confirm(`Hapus permanen seluruh ${state.transactions.length} riwayat transaksi?`))return;
-  if(!confirm('Konfirmasi sekali lagi: semua data transaksi akan terhapus. Lanjutkan?'))return;
+
+window.resetAllTransactions = async () => {
+  if(!state.transactions.length) return toast('Tidak ada riwayat transaksi untuk dihapus','err');
+  if(!confirm(`Hapus permanen seluruh ${state.transactions.length} riwayat transaksi?`)) return;
+  if(!confirm('Konfirmasi sekali lagi: semua data transaksi akan terhapus. Lanjutkan?')) return;
   try{
-    if(storageMode==='local'){
+    if(storageMode === 'local'){
       const local = readLocalDB();
       local.transactions = [];
       writeLocalDB(local);
       syncStateFromLocal();
     }else{
-      const snap=await getDocs(collection(db,'transactions'));
+      const snap = await getDocs(collection(db,'transactions'));
       for(const d of snap.docs){ await deleteDoc(doc(db,'transactions',d.id)); }
     }
     toast('Seluruh riwayat transaksi telah dihapus');
   }catch(err){ toast('Gagal menghapus transaksi: '+err.message,'err'); }
 };
-window.renderTrx=function(){
-  const from=document.getElementById('trx-from').value;
-  const to=document.getElementById('trx-to').value;
-  const out=document.getElementById('trx-outlet').value;
-  const st=document.getElementById('trx-status').value;
 
-  let list=state.transactions.filter(t=>{
-    if(out!=='all'&&t.outletId!==out)return false;
-    const tStatus=t.status||'completed';
-    if(st!=='all'&&tStatus!==st)return false;
-    const d=t.date?t.date.split('T')[0]:'';
-    if(from&&d<from)return false;
-    if(to&&d>to)return false;
+function renderTrx(){
+  const from = document.getElementById('trx-from')?.value || '';
+  const to = document.getElementById('trx-to')?.value || '';
+  const out = document.getElementById('trx-outlet')?.value || 'all';
+  const st = document.getElementById('trx-status')?.value || 'all';
+
+  const list = state.transactions.filter(t => {
+    if(out !== 'all' && t.outletId !== out) return false;
+    const tStatus = t.status || 'completed';
+    if(st !== 'all' && tStatus !== st) return false;
+    const d = t.date ? String(t.date).split('T')[0] : '';
+    if(from && d < from) return false;
+    if(to && d > to) return false;
     return true;
   });
 
-  document.querySelector('#trx-table tbody').innerHTML=list.length?list.map(t=>`
+  document.querySelector('#trx-table tbody').innerHTML = list.length ? list.map(t => `
     <tr>
       <td><strong>${t.id}</strong></td>
       <td>${t.outletName||'-'}</td>
       <td>${t.employeeName||'-'}</td>
       <td style="color:var(--muted);font-size:.8rem">${fmtDate(t.date)}</td>
-      <td>${(t.items||[]).reduce((s,i)=>s+i.qty,0)}</td>
+      <td>${(t.items||[]).reduce((s,i) => s + Number(i.qty||0), 0)}</td>
       <td style="color:${t.status==='refunded'?'var(--muted)':'var(--accent)'};font-weight:600">${rp(t.total)}</td>
-      <td><span class="badge badge-info">${t.method}</span></td>
+      <td><span class="badge badge-info">${t.method||'-'}</span></td>
       <td><span class="badge ${t.status==='refunded'?'badge-danger':'badge-ok'}">${t.status==='refunded'?'Refunded':'Selesai'}</span></td>
       <td><button class="btn btn-sm btn-ghost" onclick="openTrxDetail('${t.id}')">Detail</button></td>
-    </tr>`).join(''):'<tr><td colspan="9" class="empty">Tidak ada transaksi sesuai filter</td></tr>';
-};
-window.openTrxDetail=id=>{
-  const t=state.transactions.find(x=>x.id===id);if(!t)return;
-  const isRefunded=t.status==='refunded';
-  document.getElementById('trx-detail-body').innerHTML=`
+    </tr>`).join('') : '<tr><td colspan="9" class="empty">Tidak ada transaksi sesuai filter</td></tr>';
+}
+window.renderTrx = renderTrx;
+
+window.openTrxDetail = id => {
+  const t = state.transactions.find(x => x.id === id);
+  if(!t) return;
+  const isRefunded = t.status === 'refunded';
+  document.getElementById('trx-detail-body').innerHTML = `
     <div style="background:var(--bg);padding:14px;border-radius:8px;margin-bottom:14px">
       <div style="display:flex;justify-content:space-between;margin-bottom:6px"><span style="color:var(--muted)">ID</span><strong>${t.id}</strong></div>
       <div style="display:flex;justify-content:space-between;margin-bottom:6px"><span style="color:var(--muted)">Status</span><span class="badge ${isRefunded?'badge-danger':'badge-ok'}">${isRefunded?'REFUNDED':'SELESAI'}</span></div>
       <div style="display:flex;justify-content:space-between;margin-bottom:6px"><span style="color:var(--muted)">Tanggal</span><span>${fmtDate(t.date)}</span></div>
       <div style="display:flex;justify-content:space-between;margin-bottom:6px"><span style="color:var(--muted)">Outlet</span><span>${t.outletName||'-'}</span></div>
       <div style="display:flex;justify-content:space-between;margin-bottom:6px"><span style="color:var(--muted)">Kasir</span><span>${t.employeeName||'-'}</span></div>
-      <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">Pembayaran</span><span>${t.paymentDetail||t.method}</span></div>
+      <div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">Pembayaran</span><span>${t.paymentDetail||t.method||'-'}</span></div>
     </div>
-    <table style="width:100%;min-width:0"><thead><tr><th>Item</th><th>Qty</th><th>Harga</th><th>Sub</th></tr></thead><tbody>${(t.items||[]).map(i=>`<tr><td>${i.name}</td><td>${i.qty}</td><td>${rp(i.price)}</td><td>${rp(i.price*i.qty)}</td></tr>`).join('')}</tbody></table>
+    <table style="width:100%;min-width:0"><thead><tr><th>Item</th><th>Qty</th><th>Harga</th><th>Sub</th></tr></thead><tbody>${(t.items||[]).map(i => `<tr><td>${i.name}</td><td>${i.qty}</td><td>${rp(i.price)}</td><td>${rp((i.price||0)*(i.qty||1))}</td></tr>`).join('')}</tbody></table>
     <div style="background:var(--bg);padding:14px;border-radius:8px;margin-top:14px">
       <div style="display:flex;justify-content:space-between;margin-bottom:4px"><span style="color:var(--muted)">Subtotal</span><span>${rp(t.subtotal)}</span></div>
       <div style="display:flex;justify-content:space-between;margin-bottom:4px"><span style="color:var(--muted)">Diskon</span><span>-${rp(t.discount)}</span></div>
@@ -1043,90 +1183,79 @@ window.openTrxDetail=id=>{
       <div style="display:flex;justify-content:space-between;font-size:1.2rem;font-weight:700;padding-top:8px;border-top:1px dashed var(--border);margin-top:8px"><span>TOTAL</span><span style="color:var(--accent)">${rp(t.total)}</span></div>
     </div>`;
 
-  const btnRefund=document.getElementById('btn-refund');
-  btnRefund.style.display=isRefunded?'none':'inline-flex';
-  btnRefund.onclick=async()=>{
-    if(!confirm('Refund transaksi ini? Stok barang akan otomatis dikembalikan.'))return;
-    btnRefund.disabled=true;
+  const btnRefund = document.getElementById('btn-refund');
+  btnRefund.style.display = isRefunded ? 'none' : 'inline-flex';
+  btnRefund.onclick = async () => {
+    if(!confirm('Refund transaksi ini? Stok barang akan otomatis dikembalikan.')) return;
+    btnRefund.disabled = true;
     try{
-      if(storageMode==='local'){
+      if(storageMode === 'local'){
         const local = readLocalDB();
-        local.transactions = local.transactions.map(tr => tr.id===t.id ? {...tr, status:'refunded', refundedAt:new Date().toISOString(), refundedBy:currentUser?.name||'Admin'} : tr);
+        local.transactions = local.transactions.map(tr => tr.id === t.id ? { ...tr, status:'refunded', refundedAt:new Date().toISOString(), refundedBy:currentUser?.name||'Admin' } : tr);
         for(const i of (t.items||[])){
-          local.products = local.products.map(pr => pr.id===i.id ? {...pr, stock:(Number(pr.stock)||0)+(Number(i.qty)||0)} : pr);
+          local.products = local.products.map(pr => pr.id === i.id ? { ...pr, stock: Number(pr.stock||0) + Number(i.qty||0) } : pr);
         }
         writeLocalDB(local);
         syncStateFromLocal();
       }else{
-        await updateDoc(doc(db,'transactions',t.id),{status:'refunded',refundedAt:new Date().toISOString(),refundedBy:currentUser?.name||'Admin'});
+        await updateDoc(doc(db,'transactions',t.id), { status:'refunded', refundedAt:new Date().toISOString(), refundedBy:currentUser?.name||'Admin' });
         for(const i of (t.items||[])){
-          const pRef=doc(db,'products',i.id);
-          const pSnap=await getDoc(pRef);
-          if(pSnap.exists()){await updateDoc(pRef,{stock:increment(i.qty)})}
+          const pRef = doc(db,'products',i.id);
+          const pSnap = await getDoc(pRef);
+          if(pSnap.exists()){ await updateDoc(pRef, { stock: increment(Number(i.qty||0)) }); }
         }
       }
-      closeM('m-trx-detail');toast('Refund berhasil & stok dikembalikan');
-    }catch(err){toast('Gagal refund: '+err.message,'err')}
-    finally{btnRefund.disabled=false}
+      closeM('m-trx-detail');
+      toast('Refund berhasil & stok dikembalikan');
+    }catch(err){ toast('Gagal refund: '+err.message,'err'); }
+    finally{ btnRefund.disabled = false; }
   };
   document.getElementById('m-trx-detail').classList.add('active');
 };
 
 function generateCSVContent(){
-  const sep=';';
-  const esc=val=>`"${String(val??'').replace(/"/g,'""')}"`;
-  const headers=[
+  const sep = ';';
+  const esc = val => `"${String(val??'').replace(/"/g,'""')}"`;
+  const headers = [
     'ID Transaksi','Tanggal & Waktu','Outlet','Kasir',
     'Rincian Item','Jumlah Item','Subtotal (Rp)','Diskon (Rp)',
     'Pajak (Rp)','Total (Rp)','Metode Bayar','Status'
   ];
-  const rows=[headers.map(esc).join(sep)];
+  const rows = [headers.map(esc).join(sep)];
 
-  state.transactions.forEach(t=>{
-    const itemsList=(t.items||[]).map(i=>`${i.name} (${i.qty}x @${i.price})`).join(', ');
-    const totalQty=(t.items||[]).reduce((s,i)=>s+(i.qty||0),0);
-    const statusLabel=t.status==='refunded'?'Refunded':'Selesai';
+  state.transactions.forEach(t => {
+    const itemsList = (t.items||[]).map(i => `${i.name} (${i.qty}x @${i.price})`).join(', ');
+    const totalQty = (t.items||[]).reduce((s,i) => s + Number(i.qty||0), 0);
+    const statusLabel = t.status === 'refunded' ? 'Refunded' : 'Selesai';
     rows.push([
-      t.id,
-      fmtDate(t.date),
-      t.outletName||'-',
-      t.employeeName||'-',
-      itemsList||'-',
-      totalQty,
-      t.subtotal||0,
-      t.discount||0,
-      t.tax||0,
-      t.total||0,
-      t.paymentDetail||t.method||'-',
-      statusLabel
+      t.id, fmtDate(t.date), t.outletName||'-', t.employeeName||'-',
+      itemsList||'-', totalQty, t.subtotal||0, t.discount||0,
+      t.tax||0, t.total||0, t.paymentDetail||t.method||'-', statusLabel
     ].map(esc).join(sep));
   });
-  return '\uFEFF'+rows.join('\n');
+  return '\uFEFF' + rows.join('\n');
 }
 
-function getCSVFilename(){
-  return `laporan_transaksi_${todayISO()}.csv`;
-}
+function getCSVFilename(){ return `laporan_transaksi_${todayISO()}.csv`; }
 
-window.exportCSV=()=>{
+function exportCSV(){
   const csvContent = generateCSVContent();
-  const b=new Blob([csvContent],{type:'text/csv;charset=utf-8;'});
-  const u=URL.createObjectURL(b);
-  const a=document.createElement('a');
-  a.href=u;
-  a.download=getCSVFilename();
+  const b = new Blob([csvContent], { type:'text/csv;charset=utf-8;' });
+  const u = URL.createObjectURL(b);
+  const a = document.createElement('a');
+  a.href = u;
+  a.download = getCSVFilename();
   a.click();
   URL.revokeObjectURL(u);
   toast('CSV berhasil diunduh');
-};
+}
+window.exportCSV = exportCSV;
 
-window.openShareCSVModal=()=>{
-  document.getElementById('m-share-csv').classList.add('active');
-};
+window.openShareCSVModal = () => document.getElementById('m-share-csv').classList.add('active');
 
 function buildReportSummaryText(){
-  const validTrx = state.transactions.filter(t=>t.status!=='refunded');
-  const omzet = validTrx.reduce((s,t)=>s+(t.total||0),0);
+  const validTrx = state.transactions.filter(t => t.status !== 'refunded');
+  const omzet = validTrx.reduce((s,t) => s + Number(t.total||0), 0);
   const appName = state.settings.appName || 'JOY POS';
   return `Laporan Transaksi ${appName} (${todayISO()})\nTotal Transaksi Sukses: ${validTrx.length}\nTotal Omzet Bersih: ${rp(omzet)}\n(File CSV terlampir / terunduh)`;
 }
@@ -1137,36 +1266,31 @@ window.shareCSVNative = async () => {
   const file = new File([csvContent], fileName, { type:'text/csv;charset=utf-8;' });
   if(navigator.canShare && navigator.canShare({ files:[file] })){
     try{
-      await navigator.share({
-        title: fileName,
-        text: buildReportSummaryText(),
-        files: [file]
-      });
+      await navigator.share({ title: fileName, text: buildReportSummaryText(), files: [file] });
       toast('Laporan CSV dibagikan');
       return;
     }catch(err){
       if(err.name === 'AbortError') return;
     }
   }
-  window.exportCSV();
+  exportCSV();
   sendCSVViaWhatsApp();
 };
 
 window.sendCSVViaWhatsApp = () => {
-  window.exportCSV();
+  exportCSV();
   const text = encodeURIComponent(buildReportSummaryText());
   window.open(`https://wa.me/?text=${text}`, '_blank');
 };
 
 window.sendCSVViaEmail = () => {
-  window.exportCSV();
+  exportCSV();
   const to = encodeURIComponent((document.getElementById('share-csv-email')?.value||'').trim());
   const subject = encodeURIComponent(`Laporan CSV Transaksi - ${todayISO()}`);
   const body = encodeURIComponent(buildReportSummaryText());
   window.location.href = `mailto:${to}?subject=${subject}&body=${body}`;
 };
 
-// === PRODUCTS ===
 document.getElementById('f-product-photo').addEventListener('change', async e => {
   const file = e.target.files[0];
   if(!file) return;
@@ -1175,97 +1299,111 @@ document.getElementById('f-product-photo').addEventListener('change', async e =>
     const prev = document.getElementById('f-product-photo-preview');
     prev.src = pendingProductPhotoData;
     prev.style.display = 'block';
-  }catch(err){ toast('Gagal memuat foto produk','err'); }
+  }catch(_){ toast('Gagal memuat foto produk','err'); }
 });
 
-window.openProductModal=id=>{
-  pendingProductPhotoData=null;
-  document.getElementById('f-product-photo').value='';
-  const prev=document.getElementById('f-product-photo-preview');
-  prev.style.display='none'; prev.src='';
+window.openProductModal = id => {
+  pendingProductPhotoData = null;
+  document.getElementById('f-product-photo').value = '';
+  const prev = document.getElementById('f-product-photo-preview');
+  prev.style.display = 'none'; prev.src = '';
 
-  document.getElementById('m-product-title').textContent=id?'Edit Produk':'Tambah Produk';
-  document.getElementById('f-product-id').value=id||'';
+  document.getElementById('m-product-title').textContent = id ? 'Edit Produk' : 'Tambah Produk';
+  document.getElementById('f-product-id').value = id || '';
   if(id){
-    const p=state.products.find(x=>x.id===id);
-    document.getElementById('f-product-sku').value=p.sku;
-    document.getElementById('f-product-name').value=p.name;
-    document.getElementById('f-product-cost').value=p.costPrice||0;
-    document.getElementById('f-product-price').value=p.price;
-    document.getElementById('f-product-stock').value=p.stock;
-    if(p.photo){ prev.src=p.photo; prev.style.display='block'; }
+    const p = state.products.find(x => x.id === id);
+    if(!p) return;
+    document.getElementById('f-product-sku').value = p.sku || '';
+    document.getElementById('f-product-name').value = p.name || '';
+    document.getElementById('f-product-cost').value = p.costPrice || 0;
+    document.getElementById('f-product-price').value = p.price || 0;
+    document.getElementById('f-product-stock').value = p.stock ?? 0;
+    if(p.photo){ prev.src = p.photo; prev.style.display = 'block'; }
   }else{
-    ['f-product-sku','f-product-name','f-product-cost','f-product-price','f-product-stock'].forEach(x=>document.getElementById(x).value='');
+    ['f-product-sku','f-product-name','f-product-cost','f-product-price','f-product-stock'].forEach(x => document.getElementById(x).value = '');
   }
   document.getElementById('m-product').classList.add('active');
 };
-window.saveProduct=async()=>{
-  const id=document.getElementById('f-product-id').value;
-  const sku=document.getElementById('f-product-sku').value.trim();
-  const name=document.getElementById('f-product-name').value.trim();
-  const costPrice=+document.getElementById('f-product-cost').value||0;
-  const price=+document.getElementById('f-product-price').value;
-  const stock=+document.getElementById('f-product-stock').value;
-  if(!sku||!name||!price)return toast('SKU, nama, dan harga jual wajib diisi','err');
-  const existing=id?state.products.find(x=>x.id===id):null;
-  const photo=pendingProductPhotoData!==null ? pendingProductPhotoData : (existing?.photo||'');
-  const data={sku,name,costPrice,price,stock:isNaN(stock)?0:stock,photo};
 
-  if(storageMode==='local'){
-    const local = readLocalDB();
-    if(id){
-      local.products = local.products.map(p => p.id===id ? {...p, ...data} : p);
+window.saveProduct = async () => {
+  const id = document.getElementById('f-product-id').value;
+  const sku = document.getElementById('f-product-sku').value.trim();
+  const name = document.getElementById('f-product-name').value.trim();
+  const costPrice = Number(document.getElementById('f-product-cost').value) || 0;
+  const price = Number(document.getElementById('f-product-price').value);
+  const stock = Number(document.getElementById('f-product-stock').value);
+  if(!sku || !name || !price) return toast('SKU, nama, dan harga jual wajib diisi','err');
+  const existing = id ? state.products.find(x => x.id === id) : null;
+  const photo = pendingProductPhotoData !== null ? pendingProductPhotoData : (existing?.photo || '');
+  const data = { sku, name, costPrice, price, stock: isNaN(stock) ? 0 : stock, photo };
+
+  try{
+    if(storageMode === 'local'){
+      const local = readLocalDB();
+      if(id){
+        local.products = local.products.map(p => p.id === id ? { ...p, ...data } : p);
+      }else{
+        local.products.push({ id: uid(), ...data });
+      }
+      writeLocalDB(local);
+      syncStateFromLocal();
     }else{
-      local.products.push({ id: uid(), ...data });
+      if(id) await updateDoc(doc(db,'products',id), data);
+      else await setDoc(doc(db,'products',uid()), data);
     }
-    writeLocalDB(local);
-    syncStateFromLocal();
-  }else{
-    if(id)await updateDoc(doc(db,'products',id),data);
-    else await setDoc(doc(db,'products',uid()),data);
-  }
-  pendingProductPhotoData=null;
-  closeM('m-product');toast('Produk disimpan');
+    pendingProductPhotoData = null;
+    closeM('m-product');
+    toast('Produk disimpan');
+  }catch(err){ toast('Gagal menyimpan produk: '+err.message,'err'); }
 };
-window.quickRestock=async(id,name)=>{
-  const add=prompt(`Tambah jumlah stok masuk untuk "${name}":`,'10');
-  if(add===null)return;
-  const qty=parseInt(add,10);
-  if(isNaN(qty)||qty<=0)return toast('Jumlah harus angka positif','err');
-  if(storageMode==='local'){
-    const local = readLocalDB();
-    local.products = local.products.map(p => p.id===id ? {...p, stock:(Number(p.stock)||0)+qty} : p);
-    writeLocalDB(local);
-    syncStateFromLocal();
-  }else{
-    await updateDoc(doc(db,'products',id),{stock:increment(qty)});
-  }
-  toast(`Stok ${name} bertambah +${qty}`);
+
+window.quickRestock = async (id, name) => {
+  const add = prompt(`Tambah jumlah stok masuk untuk "${name}":`, '10');
+  if(add === null) return;
+  const qty = parseInt(add, 10);
+  if(isNaN(qty) || qty <= 0) return toast('Jumlah harus angka positif','err');
+  try{
+    if(storageMode === 'local'){
+      const local = readLocalDB();
+      local.products = local.products.map(p => p.id === id ? { ...p, stock: Number(p.stock||0) + qty } : p);
+      writeLocalDB(local);
+      syncStateFromLocal();
+    }else{
+      await updateDoc(doc(db,'products',id), { stock: increment(qty) });
+    }
+    toast(`Stok ${name} bertambah +${qty}`);
+  }catch(err){ toast('Gagal tambah stok: '+err.message,'err'); }
 };
-window.deleteProduct=async id=>{
-  if(!confirm('Hapus produk ini?'))return;
-  if(storageMode==='local'){
-    const local = readLocalDB();
-    local.products = local.products.filter(p => p.id!==id);
-    writeLocalDB(local);
-    syncStateFromLocal();
-  }else{
-    await deleteDoc(doc(db,'products',id));
-  }
-  toast('Produk dihapus');
+
+window.deleteProduct = async id => {
+  if(!confirm('Hapus produk ini?')) return;
+  try{
+    if(storageMode === 'local'){
+      const local = readLocalDB();
+      local.products = local.products.filter(p => p.id !== id);
+      writeLocalDB(local);
+      syncStateFromLocal();
+    }else{
+      await deleteDoc(doc(db,'products',id));
+    }
+    toast('Produk dihapus');
+  }catch(err){ toast('Gagal hapus produk: '+err.message,'err'); }
 };
-window.renderProducts=function(){
-  const q=(document.getElementById('prod-search')?.value||'').toLowerCase();
-  const f=document.getElementById('prod-filter')?.value||'all';
-  const filtered=state.products.filter(p=>{
-    if(q && !p.name.toLowerCase().includes(q) && !p.sku.toLowerCase().includes(q))return false;
-    if(f==='low' && p.stock>=10)return false;
-    if(f==='out' && p.stock>0)return false;
+
+function renderProducts(){
+  const q = (document.getElementById('prod-search')?.value || '').toLowerCase();
+  const f = document.getElementById('prod-filter')?.value || 'all';
+  const filtered = state.products.filter(p => {
+    if(q && !String(p.name||'').toLowerCase().includes(q) && !String(p.sku||'').toLowerCase().includes(q)) return false;
+    const st = Number(p.stock||0);
+    if(f === 'low' && st >= 10) return false;
+    if(f === 'out' && st > 0) return false;
     return true;
   });
-  document.querySelector('#prod-table tbody').innerHTML=filtered.length?filtered.map(p=>{
-    const margin=p.price-(p.costPrice||0);
-    const thumb=p.photo?`<img src="${p.photo}" class="thumb-img" alt="${p.name}">`:`<span class="thumb-placeholder">📦</span>`;
+  document.querySelector('#prod-table tbody').innerHTML = filtered.length ? filtered.map(p => {
+    const margin = Number(p.price||0) - Number(p.costPrice||0);
+    const thumb = p.photo ? `<img src="${p.photo}" class="thumb-img" alt="${p.name}">` : `<span class="thumb-placeholder">📦</span>`;
+    const safeName = String(p.name||'').replace(/'/g,"\\'");
     return `<tr>
       <td>${thumb}</td>
       <td><code>${p.sku}</code></td>
@@ -1273,17 +1411,17 @@ window.renderProducts=function(){
       <td style="color:var(--muted)">${rp(p.costPrice||0)}</td>
       <td>${rp(p.price)}</td>
       <td style="color:var(--accent);font-size:.8rem">${rp(margin)}</td>
-      <td><span class="badge ${p.stock===0?'badge-danger':p.stock<10?'badge-warn':'badge-ok'}">${p.stock}</span></td>
+      <td><span class="badge ${Number(p.stock)===0?'badge-danger':Number(p.stock)<10?'badge-warn':'badge-ok'}">${p.stock}</span></td>
       <td>
-        <button class="btn btn-sm btn-ghost" title="Tambah Stok" onclick="quickRestock('${p.id}','${p.name.replace(/'/g,"\\'")}')">+ Stok</button>
+        <button class="btn btn-sm btn-ghost" title="Tambah Stok" onclick="quickRestock('${p.id}','${safeName}')">+ Stok</button>
         <button class="btn btn-sm btn-ghost" onclick="openProductModal('${p.id}')">Edit</button>
         <button class="btn btn-sm btn-danger" onclick="deleteProduct('${p.id}')">Hapus</button>
       </td>
     </tr>`;
-  }).join(''):'<tr><td colspan="8" class="empty">Tidak ada produk ditemukan</td></tr>';
-};
+  }).join('') : '<tr><td colspan="8" class="empty">Tidak ada produk ditemukan</td></tr>';
+}
+window.renderProducts = renderProducts;
 
-// === OUTLETS ===
 document.getElementById('f-outlet-photo').addEventListener('change', async e => {
   const file = e.target.files[0];
   if(!file) return;
@@ -1292,129 +1430,155 @@ document.getElementById('f-outlet-photo').addEventListener('change', async e => 
     const prev = document.getElementById('f-outlet-photo-preview');
     prev.src = pendingOutletPhotoData;
     prev.style.display = 'block';
-  }catch(err){ toast('Gagal memuat foto outlet','err'); }
+  }catch(_){ toast('Gagal memuat foto outlet','err'); }
 });
 
-window.openOutletModal=id=>{
-  pendingOutletPhotoData=null;
-  document.getElementById('f-outlet-photo').value='';
-  const prev=document.getElementById('f-outlet-photo-preview');
-  prev.style.display='none'; prev.src='';
+window.openOutletModal = id => {
+  pendingOutletPhotoData = null;
+  document.getElementById('f-outlet-photo').value = '';
+  const prev = document.getElementById('f-outlet-photo-preview');
+  prev.style.display = 'none'; prev.src = '';
 
-  document.getElementById('m-outlet-title').textContent=id?'Edit Outlet':'Tambah Outlet';
-  document.getElementById('f-outlet-id').value=id||'';
+  document.getElementById('m-outlet-title').textContent = id ? 'Edit Outlet' : 'Tambah Outlet';
+  document.getElementById('f-outlet-id').value = id || '';
   if(id){
-    const o=state.outlets.find(x=>x.id===id);
-    document.getElementById('f-outlet-name').value=o.name;
-    document.getElementById('f-outlet-address').value=o.address;
-    document.getElementById('f-outlet-phone').value=o.phone||'';
-    if(o.photo){ prev.src=o.photo; prev.style.display='block'; }
+    const o = state.outlets.find(x => x.id === id);
+    if(!o) return;
+    document.getElementById('f-outlet-name').value = o.name || '';
+    document.getElementById('f-outlet-address').value = o.address || '';
+    document.getElementById('f-outlet-phone').value = o.phone || '';
+    if(o.photo){ prev.src = o.photo; prev.style.display = 'block'; }
   }else{
-    ['f-outlet-name','f-outlet-address','f-outlet-phone'].forEach(x=>document.getElementById(x).value='');
+    ['f-outlet-name','f-outlet-address','f-outlet-phone'].forEach(x => document.getElementById(x).value = '');
   }
   document.getElementById('m-outlet').classList.add('active');
 };
-window.saveOutlet=async()=>{
-  const id=document.getElementById('f-outlet-id').value,name=document.getElementById('f-outlet-name').value.trim(),address=document.getElementById('f-outlet-address').value.trim(),phone=document.getElementById('f-outlet-phone').value.trim();
-  if(!name||!address)return toast('Nama & alamat wajib','err');
-  const existing=id?state.outlets.find(x=>x.id===id):null;
-  const photo=pendingOutletPhotoData!==null ? pendingOutletPhotoData : (existing?.photo||'');
-  const data={name,address,phone,photo};
 
-  if(storageMode==='local'){
-    const local = readLocalDB();
-    if(id){
-      local.outlets = local.outlets.map(o => o.id===id ? {...o, ...data} : o);
+window.saveOutlet = async () => {
+  const id = document.getElementById('f-outlet-id').value;
+  const name = document.getElementById('f-outlet-name').value.trim();
+  const address = document.getElementById('f-outlet-address').value.trim();
+  const phone = document.getElementById('f-outlet-phone').value.trim();
+  if(!name || !address) return toast('Nama & alamat wajib','err');
+  const existing = id ? state.outlets.find(x => x.id === id) : null;
+  const photo = pendingOutletPhotoData !== null ? pendingOutletPhotoData : (existing?.photo || '');
+  const data = { name, address, phone, photo };
+
+  try{
+    if(storageMode === 'local'){
+      const local = readLocalDB();
+      if(id){
+        local.outlets = local.outlets.map(o => o.id === id ? { ...o, ...data } : o);
+      }else{
+        local.outlets.push({ id: uid(), ...data });
+      }
+      writeLocalDB(local);
+      syncStateFromLocal();
     }else{
-      local.outlets.push({ id: uid(), ...data });
+      if(id) await updateDoc(doc(db,'outlets',id), data);
+      else await setDoc(doc(db,'outlets',uid()), data);
     }
-    writeLocalDB(local);
-    syncStateFromLocal();
-  }else{
-    if(id)await updateDoc(doc(db,'outlets',id),data);
-    else await setDoc(doc(db,'outlets',uid()),data);
-  }
-  pendingOutletPhotoData=null;
-  closeM('m-outlet');toast('Outlet disimpan');
+    pendingOutletPhotoData = null;
+    closeM('m-outlet');
+    toast('Outlet disimpan');
+  }catch(err){ toast('Gagal menyimpan outlet: '+err.message,'err'); }
 };
-window.deleteOutlet=async id=>{
-  if(!confirm('Hapus outlet?'))return;
-  if(storageMode==='local'){
-    const local = readLocalDB();
-    local.outlets = local.outlets.filter(o => o.id!==id);
-    writeLocalDB(local);
-    syncStateFromLocal();
-  }else{
-    await deleteDoc(doc(db,'outlets',id));
-  }
-  toast('Outlet dihapus');
+
+window.deleteOutlet = async id => {
+  if(!confirm('Hapus outlet?')) return;
+  try{
+    if(storageMode === 'local'){
+      const local = readLocalDB();
+      local.outlets = local.outlets.filter(o => o.id !== id);
+      writeLocalDB(local);
+      syncStateFromLocal();
+    }else{
+      await deleteDoc(doc(db,'outlets',id));
+    }
+    toast('Outlet dihapus');
+  }catch(err){ toast('Gagal hapus outlet: '+err.message,'err'); }
 };
+
 function renderOutlets(){
-  document.querySelector('#outlet-table tbody').innerHTML=state.outlets.length?state.outlets.map(o=>{
-    const thumb=o.photo?`<img src="${o.photo}" class="thumb-img" alt="${o.name}">`:`<span class="thumb-placeholder">🏪</span>`;
+  document.querySelector('#outlet-table tbody').innerHTML = state.outlets.length ? state.outlets.map(o => {
+    const thumb = o.photo ? `<img src="${o.photo}" class="thumb-img" alt="${o.name}">` : `<span class="thumb-placeholder">🏪</span>`;
     return `<tr><td>${thumb}</td><td><strong>${o.name}</strong></td><td style="color:var(--muted)">${o.address}</td><td>${o.phone||'-'}</td><td><button class="btn btn-sm btn-ghost" onclick="openOutletModal('${o.id}')">Edit</button> <button class="btn btn-sm btn-danger" onclick="deleteOutlet('${o.id}')">Hapus</button></td></tr>`;
-  }).join(''):'<tr><td colspan="5" class="empty">Belum ada outlet</td></tr>';
+  }).join('') : '<tr><td colspan="5" class="empty">Belum ada outlet</td></tr>';
 }
 
-// === EMPLOYEES ===
-window.openEmployeeModal=(id,defaultRole='cashier')=>{
-  document.getElementById('m-employee-title').textContent=id?'Edit Data':'Tambah Data';
-  document.getElementById('f-employee-id').value=id||'';
+window.openEmployeeModal = (id, defaultRole='cashier') => {
+  updateOutletSelects();
+  document.getElementById('m-employee-title').textContent = id ? 'Edit Data' : 'Tambah Data';
+  document.getElementById('f-employee-id').value = id || '';
   if(id){
-    const e=state.employees.find(x=>x.id===id);
-    document.getElementById('f-employee-name').value=e.name;
-    document.getElementById('f-employee-role').value=e.role;
-    document.getElementById('f-employee-outlet').value=e.outletId;
-    document.getElementById('f-employee-pin').value=e.pin;
+    const e = state.employees.find(x => x.id === id);
+    if(!e) return;
+    document.getElementById('f-employee-name').value = e.name || '';
+    document.getElementById('f-employee-role').value = normRole(e.role) || 'cashier';
+    document.getElementById('f-employee-outlet').value = e.outletId || (state.outlets[0]?.id || '');
+    document.getElementById('f-employee-pin').value = e.pin || '';
   }else{
-    document.getElementById('f-employee-name').value='';
-    document.getElementById('f-employee-pin').value='';
-    document.getElementById('f-employee-role').value=defaultRole;
+    document.getElementById('f-employee-name').value = '';
+    document.getElementById('f-employee-pin').value = '';
+    document.getElementById('f-employee-role').value = defaultRole;
+    if(state.outlets.length) document.getElementById('f-employee-outlet').value = state.outlets[0].id;
   }
   document.getElementById('m-employee').classList.add('active');
 };
-window.saveEmployee=async()=>{
-  const id=document.getElementById('f-employee-id').value,name=document.getElementById('f-employee-name').value.trim(),role=document.getElementById('f-employee-role').value,outletId=document.getElementById('f-employee-outlet').value,pin=document.getElementById('f-employee-pin').value.trim();
-  if(!name||!outletId||pin.length<4)return toast('Nama, outlet, PIN (min 4 digit) wajib','err');
-  const data={name,role,outletId,pin};
 
-  if(storageMode==='local'){
-    const local = readLocalDB();
-    if(id){
-      local.employees = local.employees.map(e => e.id===id ? {...e, ...data} : e);
+window.saveEmployee = async () => {
+  const id = document.getElementById('f-employee-id').value;
+  const name = document.getElementById('f-employee-name').value.trim();
+  const role = normRole(document.getElementById('f-employee-role').value);
+  const outletId = document.getElementById('f-employee-outlet').value;
+  const pin = document.getElementById('f-employee-pin').value.trim();
+  if(!name || !outletId || pin.length < 4) return toast('Nama, outlet, PIN (min 4 digit) wajib','err');
+  const data = { name, role, outletId, pin };
+
+  try{
+    if(storageMode === 'local'){
+      const local = readLocalDB();
+      if(id){
+        local.employees = local.employees.map(e => e.id === id ? { ...e, ...data } : e);
+      }else{
+        local.employees.push({ id: uid(), ...data });
+      }
+      writeLocalDB(local);
+      syncStateFromLocal();
     }else{
-      local.employees.push({ id: uid(), ...data });
+      if(id) await updateDoc(doc(db,'employees',id), data);
+      else await setDoc(doc(db,'employees',uid()), data);
     }
-    writeLocalDB(local);
-    syncStateFromLocal();
-  }else{
-    if(id)await updateDoc(doc(db,'employees',id),data);
-    else await setDoc(doc(db,'employees',uid()),data);
-  }
-  closeM('m-employee');toast('Data tersimpan');
+    closeM('m-employee');
+    toast('Data tersimpan');
+  }catch(err){ toast('Gagal menyimpan data: '+err.message,'err'); }
 };
-window.deleteEmployee=async id=>{
-  if(!confirm('Hapus data ini?'))return;
-  if(storageMode==='local'){
-    const local = readLocalDB();
-    local.employees = local.employees.filter(e => e.id!==id);
-    writeLocalDB(local);
-    syncStateFromLocal();
-  }else{
-    await deleteDoc(doc(db,'employees',id));
-  }
-  toast('Dihapus');
+
+window.deleteEmployee = async id => {
+  if(currentUser && currentUser.id === id) return toast('Tidak bisa menghapus akun yang sedang login','err');
+  if(!confirm('Hapus data ini?')) return;
+  try{
+    if(storageMode === 'local'){
+      const local = readLocalDB();
+      local.employees = local.employees.filter(e => e.id !== id);
+      writeLocalDB(local);
+      syncStateFromLocal();
+    }else{
+      await deleteDoc(doc(db,'employees',id));
+    }
+    toast('Dihapus');
+  }catch(err){ toast('Gagal menghapus data: '+err.message,'err'); }
 };
 
 function renderEmpRows(list, isOwner){
   if(!list.length) return '<tr><td colspan="5" class="empty">Belum ada data</td></tr>';
-  return list.map(e=>{
-    const o=state.outlets.find(x=>x.id===e.outletId);
-    const badgeClass=isOwner?'badge-gold':'badge-info';
+  return list.map(e => {
+    const o = state.outlets.find(x => x.id === e.outletId);
+    const badgeClass = isOwner ? 'badge-gold' : 'badge-info';
     return `<tr>
       <td><strong>${e.name}</strong></td>
       <td><span class="badge ${badgeClass}">${e.role}</span></td>
-      <td>${o?o.name:'-'}</td>
+      <td>${o ? o.name : '-'}</td>
       <td><code>${e.pin}</code></td>
       <td>
         <button class="btn btn-sm btn-ghost" onclick="openEmployeeModal('${e.id}')">Edit</button>
@@ -1423,71 +1587,96 @@ function renderEmpRows(list, isOwner){
     </tr>`;
   }).join('');
 }
+
 function renderEmployees(){
-  const owners=state.employees.filter(e=>e.role==='owner');
-  const staff=state.employees.filter(e=>e.role!=='owner');
-  document.querySelector('#owner-table tbody').innerHTML=renderEmpRows(owners, true);
-  document.querySelector('#emp-table tbody').innerHTML=renderEmpRows(staff, false);
+  const owners = state.employees.filter(e => normRole(e.role) === 'owner');
+  const staff = state.employees.filter(e => normRole(e.role) !== 'owner');
+  document.querySelector('#owner-table tbody').innerHTML = renderEmpRows(owners, true);
+  document.querySelector('#emp-table tbody').innerHTML = renderEmpRows(staff, false);
 }
 
-// === PAYMENTS ===
-window.openPaymentModal=(type,id)=>{
-  document.getElementById('f-payment-type').value=type;
-  document.getElementById('f-payment-id').value=id||'';
-  document.getElementById('f-payment-name').value='';document.getElementById('f-payment-detail').value='';document.getElementById('f-payment-image').value='';
-  const t={qris:'QRIS',bank:'Rekening Bank',ewallet:'E-Wallet'};
-  document.getElementById('m-payment-title').textContent=(id?'Edit ':'Tambah ')+t[type];
-  document.getElementById('f-payment-image-group').style.display=type==='qris'?'block':'none';
-  if(id){const pm=state.paymentMethods[type].find(x=>x.id===id);document.getElementById('f-payment-name').value=pm.name;document.getElementById('f-payment-detail').value=pm.detail||''}
+window.openPaymentModal = (type, id) => {
+  document.getElementById('f-payment-type').value = type;
+  document.getElementById('f-payment-id').value = id || '';
+  document.getElementById('f-payment-name').value = '';
+  document.getElementById('f-payment-detail').value = '';
+  document.getElementById('f-payment-image').value = '';
+  const t = { qris:'QRIS', bank:'Rekening Bank', ewallet:'E-Wallet' };
+  document.getElementById('m-payment-title').textContent = (id ? 'Edit ' : 'Tambah ') + (t[type] || 'Metode Pembayaran');
+  document.getElementById('f-payment-image-group').style.display = type === 'qris' ? 'block' : 'none';
+  if(id){
+    const pm = (state.paymentMethods[type] || []).find(x => x.id === id);
+    if(pm){
+      document.getElementById('f-payment-name').value = pm.name || '';
+      document.getElementById('f-payment-detail').value = pm.detail || '';
+    }
+  }
   document.getElementById('m-payment').classList.add('active');
 };
-window.savePayment=async()=>{
-  const type=document.getElementById('f-payment-type').value,id=document.getElementById('f-payment-id').value;
-  const name=document.getElementById('f-payment-name').value.trim(),detail=document.getElementById('f-payment-detail').value.trim();
-  const file=document.getElementById('f-payment-image').files[0];
-  if(!name)return toast('Nama wajib diisi','err');
+
+window.savePayment = async () => {
+  const type = document.getElementById('f-payment-type').value;
+  const id = document.getElementById('f-payment-id').value;
+  const name = document.getElementById('f-payment-name').value.trim();
+  const detail = document.getElementById('f-payment-detail').value.trim();
+  const file = document.getElementById('f-payment-image').files[0];
+  if(!name) return toast('Nama wajib diisi','err');
   try{
-    const existing = id ? state.paymentMethods[type]?.find(x=>x.id===id) : null;
-    const data={type,name,detail, image: existing?.image || ''};
+    const existing = id ? (state.paymentMethods[type] || []).find(x => x.id === id) : null;
+    const data = { type, name, detail, image: existing?.image || '' };
     if(file){ data.image = await compressImage(file); }
 
-    if(storageMode==='local'){
+    if(storageMode === 'local'){
       const local = readLocalDB();
       if(id){
-        local.paymentMethods = local.paymentMethods.map(pm => pm.id===id ? {...pm, ...data} : pm);
+        local.paymentMethods = local.paymentMethods.map(pm => pm.id === id ? { ...pm, ...data } : pm);
       }else{
         local.paymentMethods.push({ id: uid(), ...data });
       }
       writeLocalDB(local);
       syncStateFromLocal();
     }else{
-      if(id)await updateDoc(doc(db,'paymentMethods',id),data);
-      else await setDoc(doc(db,'paymentMethods',uid()),data);
+      if(id) await updateDoc(doc(db,'paymentMethods',id), data);
+      else await setDoc(doc(db,'paymentMethods',uid()), data);
     }
-    closeM('m-payment');toast('Metode pembayaran disimpan');
-  }catch(err){toast('Gagal menyimpan pembayaran: '+err.message,'err')}
+    closeM('m-payment');
+    toast('Metode pembayaran disimpan');
+  }catch(err){ toast('Gagal menyimpan pembayaran: '+err.message,'err'); }
 };
-window.deletePayment=async id=>{
-  if(!confirm('Hapus metode pembayaran?'))return;
-  if(storageMode==='local'){
-    const local = readLocalDB();
-    local.paymentMethods = local.paymentMethods.filter(pm => pm.id!==id);
-    writeLocalDB(local);
-    syncStateFromLocal();
-  }else{
-    await deleteDoc(doc(db,'paymentMethods',id));
-  }
-  toast('Dihapus');
+
+window.deletePayment = async id => {
+  if(!confirm('Hapus metode pembayaran?')) return;
+  try{
+    if(storageMode === 'local'){
+      const local = readLocalDB();
+      local.paymentMethods = local.paymentMethods.filter(pm => pm.id !== id);
+      writeLocalDB(local);
+      syncStateFromLocal();
+    }else{
+      await deleteDoc(doc(db,'paymentMethods',id));
+    }
+    toast('Dihapus');
+  }catch(err){ toast('Gagal menghapus metode pembayaran: '+err.message,'err'); }
 };
+
 function renderPayments(){
-  ['qris','bank','ewallet'].forEach(type=>{
-    const c=document.getElementById(type+'-list');
-    const list=state.paymentMethods[type];
-    c.innerHTML=list.length?list.map(pm=>`<div class="payment-card">${pm.image?`<img src="${pm.image}" alt="${pm.name}">`:''}<div class="pm-name">${pm.name}</div><div class="pm-detail">${pm.detail||''}</div><div class="pm-actions"><button class="btn btn-sm btn-ghost" onclick="openPaymentModal('${type}','${pm.id}')">✏️</button><button class="btn btn-sm btn-danger" onclick="deletePayment('${pm.id}')">🗑️</button></div></div>`).join(''):'<div class="empty" style="grid-column:1/-1">Belum ada data</div>';
+  ['qris','bank','ewallet'].forEach(type => {
+    const c = document.getElementById(type+'-list');
+    if(!c) return;
+    const list = state.paymentMethods[type] || [];
+    c.innerHTML = list.length ? list.map(pm => `
+      <div class="payment-card">
+        ${pm.image ? `<img src="${pm.image}" alt="${pm.name}">` : ''}
+        <div class="pm-name">${pm.name}</div>
+        <div class="pm-detail">${pm.detail||''}</div>
+        <div class="pm-actions">
+          <button class="btn btn-sm btn-ghost" onclick="openPaymentModal('${type}','${pm.id}')">✏️</button>
+          <button class="btn btn-sm btn-danger" onclick="deletePayment('${pm.id}')">🗑️</button>
+        </div>
+      </div>`).join('') : '<div class="empty" style="grid-column:1/-1">Belum ada data</div>';
   });
 }
 
-// === SETTINGS, BRANDING, SOSMED, TOKO, STRUK & MODE RESET ===
 document.getElementById('set-logo-file').addEventListener('change', async e => {
   const file = e.target.files[0];
   if(!file) return;
@@ -1501,9 +1690,7 @@ document.getElementById('set-logo-file').addEventListener('change', async e => {
     applyAppBranding();
     renderReceiptPreview();
     toast('Logo siap di-save');
-  }catch(err){
-    toast('Gagal memuat gambar logo','err');
-  }
+  }catch(_){ toast('Gagal memuat gambar logo','err'); }
 });
 
 window.clearAppLogo = () => {
@@ -1521,49 +1708,51 @@ window.saveAppIdentity = async () => {
   const receiptLogoSize = document.getElementById('set-receipt-logo-size')?.value || 'md';
   const receiptWidth = document.getElementById('set-receipt-width')?.value || '80';
   const payload = { appName, receiptLogoSize, receiptWidth };
-  if(pendingAppLogoData !== null){
-    payload.appLogo = pendingAppLogoData;
-  }
-  if(storageMode==='local'){
-    const local = readLocalDB();
-    local.settings = { ...local.settings, ...payload };
-    writeLocalDB(local);
-    pendingAppLogoData = null;
-    syncStateFromLocal();
-  }else{
-    await setDoc(doc(db,'settings','main'), payload, { merge:true });
-    state.settings = { ...state.settings, ...payload };
-    pendingAppLogoData = null;
-    applyAppBranding();
-    renderReceiptPreview();
-  }
-  toast('Nama & logo aplikasi berhasil disimpan');
+  if(pendingAppLogoData !== null){ payload.appLogo = pendingAppLogoData; }
+
+  try{
+    if(storageMode === 'local'){
+      const local = readLocalDB();
+      local.settings = { ...local.settings, ...payload };
+      writeLocalDB(local);
+      pendingAppLogoData = null;
+      syncStateFromLocal();
+    }else{
+      await setDoc(doc(db,'settings','main'), payload, { merge:true });
+      state.settings = { ...state.settings, ...payload };
+      pendingAppLogoData = null;
+      applyAppBranding();
+      renderReceiptPreview();
+    }
+    toast('Nama & logo aplikasi berhasil disimpan');
+  }catch(err){ toast('Gagal menyimpan identitas: '+err.message,'err'); }
 };
 
 function loadSettings(){
   const selMode = document.getElementById('set-storage-mode');
   if(selMode) selMode.value = storageMode;
-  const appNameEl = document.getElementById('set-app-name');
-  if(appNameEl && document.activeElement !== appNameEl){
-    appNameEl.value = state.settings.appName || 'JOY POS';
-  }
+
+  const mapInput = (id, val) => {
+    const el = document.getElementById(id);
+    if(el && document.activeElement !== el) el.value = val;
+  };
+  mapInput('set-app-name', state.settings.appName || 'JOY POS');
+  mapInput('set-soc-ig', state.settings.socialIg || '');
+  mapInput('set-soc-tiktok', state.settings.socialTiktok || '');
+  mapInput('set-soc-wa', state.settings.socialWa || '');
+  mapInput('set-soc-other', state.settings.socialOther || '');
+  mapInput('set-company', state.settings.company || '');
+  mapInput('set-tax', state.settings.tax ?? 0);
+  mapInput('set-phone', state.settings.phone || '');
+  mapInput('set-npwp', state.settings.npwp || '');
+  mapInput('set-address', state.settings.address || '');
+  mapInput('set-receipt-header', state.settings.receiptHeader || '');
+  mapInput('set-footer', state.settings.footer || '');
+
   const logoSizeEl = document.getElementById('set-receipt-logo-size');
-  if(logoSizeEl) logoSizeEl.value = state.settings.receiptLogoSize || 'md';
+  if(logoSizeEl && document.activeElement !== logoSizeEl) logoSizeEl.value = state.settings.receiptLogoSize || 'md';
   const widthEl = document.getElementById('set-receipt-width');
-  if(widthEl) widthEl.value = state.settings.receiptWidth || '80';
-
-  document.getElementById('set-soc-ig').value=state.settings.socialIg||'';
-  document.getElementById('set-soc-tiktok').value=state.settings.socialTiktok||'';
-  document.getElementById('set-soc-wa').value=state.settings.socialWa||'';
-  document.getElementById('set-soc-other').value=state.settings.socialOther||'';
-
-  document.getElementById('set-company').value=state.settings.company||'';
-  document.getElementById('set-tax').value=state.settings.tax??0;
-  document.getElementById('set-phone').value=state.settings.phone||'';
-  document.getElementById('set-npwp').value=state.settings.npwp||'';
-  document.getElementById('set-address').value=state.settings.address||'';
-  document.getElementById('set-receipt-header').value=state.settings.receiptHeader||'';
-  document.getElementById('set-footer').value=state.settings.footer||'';
+  if(widthEl && document.activeElement !== widthEl) widthEl.value = state.settings.receiptWidth || '80';
 
   document.getElementById('rcp-show-logo').checked = state.settings.receiptShowLogo !== false;
   document.getElementById('rcp-show-phone').checked = state.settings.receiptShowPhone !== false;
@@ -1586,7 +1775,7 @@ function collectReceiptConfigFromForm(){
     socialTiktok: (document.getElementById('set-soc-tiktok')?.value||'').trim(),
     socialWa: (document.getElementById('set-soc-wa')?.value||'').trim(),
     socialOther: (document.getElementById('set-soc-other')?.value||'').trim(),
-    tax: +document.getElementById('set-tax')?.value || 0,
+    tax: Number(document.getElementById('set-tax')?.value) || 0,
     receiptWidth: document.getElementById('set-receipt-width')?.value || '80',
     receiptLogoSize: document.getElementById('set-receipt-logo-size')?.value || 'md',
     receiptShowLogo: document.getElementById('rcp-show-logo')?.checked ?? true,
@@ -1598,7 +1787,7 @@ function collectReceiptConfigFromForm(){
   };
 }
 
-window.renderReceiptPreview = () => {
+function renderReceiptPreview(){
   const box = document.getElementById('receipt-preview-box');
   if(!box) return;
   const cfg = collectReceiptConfigFromForm();
@@ -1645,58 +1834,61 @@ window.renderReceiptPreview = () => {
     ${socialHtml}
     <div class="rcp-line"></div>
     <div class="rcp-center">${cfg.footer}</div>`;
-};
+}
+window.renderReceiptPreview = renderReceiptPreview;
 
 window.printReceiptSample = () => {
   renderReceiptPreview();
   window.print();
 };
 
-window.saveSettings=async()=>{
+window.saveSettings = async () => {
   const cfg = collectReceiptConfigFromForm();
-  const data={
-    company:cfg.company,
-    tax:cfg.tax,
-    phone:cfg.phone,
-    npwp:cfg.npwp,
-    address:cfg.address,
-    receiptHeader:cfg.receiptHeader,
-    footer:cfg.footer,
-    socialIg:cfg.socialIg,
-    socialTiktok:cfg.socialTiktok,
-    socialWa:cfg.socialWa,
-    socialOther:cfg.socialOther,
-    receiptWidth:cfg.receiptWidth,
-    receiptLogoSize:cfg.receiptLogoSize,
-    receiptShowLogo:cfg.receiptShowLogo,
-    receiptShowPhone:cfg.receiptShowPhone,
-    receiptShowNpwp:cfg.receiptShowNpwp,
-    receiptShowCashier:cfg.receiptShowCashier,
-    receiptShowSocial:cfg.receiptShowSocial
+  const data = {
+    company: cfg.company,
+    tax: cfg.tax,
+    phone: cfg.phone,
+    npwp: cfg.npwp,
+    address: cfg.address,
+    receiptHeader: cfg.receiptHeader,
+    footer: cfg.footer,
+    socialIg: cfg.socialIg,
+    socialTiktok: cfg.socialTiktok,
+    socialWa: cfg.socialWa,
+    socialOther: cfg.socialOther,
+    receiptWidth: cfg.receiptWidth,
+    receiptLogoSize: cfg.receiptLogoSize,
+    receiptShowLogo: cfg.receiptShowLogo,
+    receiptShowPhone: cfg.receiptShowPhone,
+    receiptShowNpwp: cfg.receiptShowNpwp,
+    receiptShowCashier: cfg.receiptShowCashier,
+    receiptShowSocial: cfg.receiptShowSocial
   };
-  if(storageMode==='local'){
-    const local = readLocalDB();
-    local.settings = { ...local.settings, ...data };
-    writeLocalDB(local);
-    syncStateFromLocal();
-  }else{
-    await setDoc(doc(db,'settings','main'),data,{merge:true});
-    state.settings = { ...state.settings, ...data };
-    renderReceiptPreview();
-  }
-  toast('Pengaturan toko, sosmed & struk disimpan');
+  try{
+    if(storageMode === 'local'){
+      const local = readLocalDB();
+      local.settings = { ...local.settings, ...data };
+      writeLocalDB(local);
+      syncStateFromLocal();
+    }else{
+      await setDoc(doc(db,'settings','main'), data, { merge:true });
+      state.settings = { ...state.settings, ...data };
+      renderReceiptPreview();
+    }
+    toast('Pengaturan toko, sosmed & struk disimpan');
+  }catch(err){ toast('Gagal menyimpan pengaturan: '+err.message,'err'); }
 };
 
 async function clearCloudCollection(colName){
-  const snap=await getDocs(collection(db,colName));
+  const snap = await getDocs(collection(db,colName));
   for(const d of snap.docs){ await deleteDoc(doc(db,colName,d.id)); }
 }
 
-window.resetAppToSeed=async()=>{
-  if(!confirm(`Atur ulang aplikasi (${storageMode==='local'?'LocalStorage':'Cloud'}) ke data awal?`))return;
-  if(!confirm('Yakin ingin mereset aplikasi sekarang?'))return;
+window.resetAppToSeed = async () => {
+  if(!confirm(`Atur ulang aplikasi (${storageMode==='local'?'LocalStorage':'Cloud'}) ke data awal?`)) return;
+  if(!confirm('Yakin ingin mereset aplikasi sekarang?')) return;
   try{
-    if(storageMode==='local'){
+    if(storageMode === 'local'){
       writeLocalDB(getDefaultSeedPayload());
       syncStateFromLocal();
     }else{
@@ -1706,57 +1898,161 @@ window.resetAppToSeed=async()=>{
       await seedCloudData(true);
     }
     toast('Aplikasi berhasil diatur ulang ke data awal (Owner: Ade Kurnia Sandy / PIN 1111)');
-  }catch(err){
-    toast('Gagal reset aplikasi: '+err.message,'err');
-  }
+  }catch(err){ toast('Gagal reset aplikasi: '+err.message,'err'); }
 };
 
-window.wipeAllAppData=async()=>{
-  if(!confirm(`KOSONGKAN SELURUH DATA di ${storageMode==='local'?'LocalStorage':'Cloud'}?`))return;
-  if(!confirm('Tindakan terakhir: semua data akan dikosongkan. Lanjutkan?'))return;
+window.wipeAllAppData = async () => {
+  if(!confirm(`KOSONGKAN SELURUH DATA di ${storageMode==='local'?'LocalStorage':'Cloud'}?`)) return;
+  if(!confirm('Tindakan terakhir: semua data akan dikosongkan. Lanjutkan?')) return;
   try{
-    if(storageMode==='local'){
+    if(storageMode === 'local'){
       writeLocalDB({
         employees:[], outlets:[], products:[], transactions:[], paymentMethods:[],
-        settings:{...DEFAULT_SETTINGS, appName:'JOY POS', company:'', footer:'', tax:0}
+        settings:{ ...DEFAULT_SETTINGS, appName:'JOY POS', company:'', footer:'', tax:0 }
       });
       syncStateFromLocal();
     }else{
       for(const col of ['transactions','products','outlets','employees','paymentMethods']){
         await clearCloudCollection(col);
       }
-      await setDoc(doc(db,'settings','main'),{...DEFAULT_SETTINGS, appName:'JOY POS', company:'', footer:'', tax:0});
+      await setDoc(doc(db,'settings','main'), { ...DEFAULT_SETTINGS, appName:'JOY POS', company:'', footer:'', tax:0 });
     }
     toast('Seluruh data berhasil dikosongkan');
-  }catch(err){
-    toast('Gagal mengosongkan data: '+err.message,'err');
-  }
+  }catch(err){ toast('Gagal mengosongkan data: '+err.message,'err'); }
 };
 
-// === SEED CLOUD ===
 async function seedCloudData(force=false){
-  const snap=await getDocs(collection(db,'outlets'));
-  if(snap.empty || force){
-    const outletId=uid();
-    await setDoc(doc(db,'outlets',outletId),{name:'Cabang Pusat',address:'Jl. Sudirman No. 1, Jakarta',phone:'021-1234567',photo:''});
-    await setDoc(doc(db,'employees',uid()),{name:'Ade Kurnia Sandy',role:'owner',outletId,pin:'1111'});
-    await setDoc(doc(db,'employees',uid()),{name:'Siti Kasir',role:'cashier',outletId,pin:'1234'});
-    await setDoc(doc(db,'products',uid()),{sku:'P001',name:'Kopi Susu',costPrice:9000,price:18000,stock:100,photo:''});
-    await setDoc(doc(db,'products',uid()),{sku:'P002',name:'Nasi Goreng',costPrice:14000,price:25000,stock:50,photo:''});
-    await setDoc(doc(db,'settings','main'),{...DEFAULT_SETTINGS, address:'Jl. Sudirman No. 1', footer:'Terima kasih telah berbelanja'});
-    if(!force){
-      toast('Data awal cloud dibuat! Login: Ade Kurnia Sandy / PIN 1111');
+  if(!FIREBASE_OK || isSeedingCloud) return;
+  isSeedingCloud = true;
+  try{
+    const outSnap = await getDocs(collection(db,'outlets'));
+    const empSnap = await getDocs(collection(db,'employees'));
+    const prodSnap = await getDocs(collection(db,'products'));
+    const setSnap = await getDoc(doc(db,'settings','main'));
+
+    let defaultOutletId = outSnap.docs[0]?.id;
+    let createdAny = false;
+
+    if(outSnap.empty || force){
+      defaultOutletId = uid();
+      await setDoc(doc(db,'outlets',defaultOutletId), {
+        name:'Cabang Pusat',
+        address:'Jl. Sudirman No. 1, Jakarta',
+        phone:'021-1234567',
+        photo:''
+      });
+      createdAny = true;
     }
+
+    const existingEmps = empSnap.docs.map(d => d.data());
+    const hasOwner = existingEmps.some(e => normRole(e.role) === 'owner');
+    if(empSnap.empty || !hasOwner || force){
+      await setDoc(doc(db,'employees',uid()), {
+        name:'Ade Kurnia Sandy',
+        role:'owner',
+        outletId: defaultOutletId,
+        pin:'1111'
+      });
+      if(empSnap.empty || force){
+        await setDoc(doc(db,'employees',uid()), {
+          name:'Siti Kasir',
+          role:'cashier',
+          outletId: defaultOutletId,
+          pin:'1234'
+        });
+      }
+      createdAny = true;
+    }
+
+    if(prodSnap.empty || force){
+      await setDoc(doc(db,'products',uid()), { sku:'P001', name:'Kopi Susu', costPrice:9000, price:18000, stock:100, photo:'' });
+      await setDoc(doc(db,'products',uid()), { sku:'P002', name:'Nasi Goreng', costPrice:14000, price:25000, stock:50, photo:'' });
+      createdAny = true;
+    }
+
+    if(!setSnap.exists() || force){
+      await setDoc(doc(db,'settings','main'), {
+        ...DEFAULT_SETTINGS,
+        address:'Jl. Sudirman No. 1',
+        footer:'Terima kasih telah berbelanja'
+      });
+      createdAny = true;
+    }
+
+    setLoginStatus('✓ Terhubung ke cloud', 'var(--accent)', false);
+    if(createdAny && !force){
+      toast('Data awal cloud siap! Login: Ade Kurnia Sandy / PIN 1111');
+    }
+  }catch(err){
+    handleCloudError('Seed Cloud', err);
+  }finally{
+    isSeedingCloud = false;
   }
 }
 
-// === INIT ===
 await activateStorageMode(storageMode);
-if(!FIREBASE_OK) toast('Firebase tidak tersambung, memakai mode lokal','err');
+if(!FIREBASE_OK){
+  toast('Firebase tidak tersambung, memakai mode lokal','err');
+}
 </script>
 
 <script>
-if ('serviceWorker' in navigator) {
+(function ensureFallbackOwnerReady(){
+  const LOCAL_KEY = 'joy_pos_local_v1';
+  const selectEl = document.getElementById('login-user');
+  const statusEl = document.getElementById('login-status');
+
+  function populateOwnersFromLocal(){
+    if(!selectEl) return false;
+    let parsed = null;
+    try{
+      const raw = localStorage.getItem(LOCAL_KEY);
+      if(raw) parsed = JSON.parse(raw);
+    }catch(_){}
+
+    if(!parsed || !Array.isArray(parsed.employees) || !parsed.employees.some(e => String(e.role||'').trim().toLowerCase() === 'owner')){
+      const outletId = 'OUTLET_PUSAT';
+      parsed = {
+        outlets: [{ id: outletId, name:'Cabang Pusat', address:'Jl. Sudirman No. 1, Jakarta', phone:'021-1234567', photo:'' }],
+        employees: [
+          { id: 'OWNER_ADE', name:'Ade Kurnia Sandy', role:'owner', outletId, pin:'1111' },
+          { id: 'CASHIER_SITI', name:'Siti Kasir', role:'cashier', outletId, pin:'1234' }
+        ],
+        products: [],
+        transactions: [],
+        paymentMethods: [],
+        settings: { appName:'JOY POS', company:'JOY CORPORATION', tax:11, footer:'Terima kasih' }
+      };
+      try{ localStorage.setItem(LOCAL_KEY, JSON.stringify(parsed)); }catch(_){}
+    }
+
+    const owners = parsed.employees.filter(e => String(e.role||'').trim().toLowerCase() === 'owner');
+    if(!owners.length) return false;
+
+    const prev = selectEl.value;
+    selectEl.innerHTML = '<option value="">— Pilih Owner —</option>' +
+      owners.map(o => `<option value="${o.id}">${o.name} (Owner)</option>`).join('');
+    if(prev && owners.some(o => o.id === prev)){
+      selectEl.value = prev;
+    }else if(owners.length === 1){
+      selectEl.value = owners[0].id;
+    }
+
+    if(statusEl && statusEl.textContent.includes('Menghubungkan')){
+      statusEl.textContent = '✓ Mode Lokal siap (PIN: 1111)';
+      statusEl.style.color = '#3b82f6';
+    }
+    return true;
+  }
+
+  setTimeout(() => {
+    if(selectEl && selectEl.options.length <= 1){
+      populateOwnersFromLocal();
+    }
+  }, 1200);
+})();
+
+if ('serviceWorker' in navigator && window.location.protocol !== 'file:') {
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('/sw.js').catch(()=>{});
   });
